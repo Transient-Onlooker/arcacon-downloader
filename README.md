@@ -24,7 +24,7 @@ python arcacon.py https://arca.live/e/52927
 결과는 페이지 제목과 번호를 사용한 폴더에 저장됩니다.
 
 ```text
-download/돚거 뿌빠콘(52927)/
+download/<아카콘 이름>(<번호>)/
 ```
 
 `-o` 옵션으로 최상위 저장 폴더를 변경할 수 있습니다.
