@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
@@ -70,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--wait", type=float, default=0.18, help="각 요소 hover 대기 시간"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(6, max(2, os.cpu_count() or 2)),
+        help="동시 다운로드·변환 작업 수 (기본: CPU 기준 자동)",
     )
     parser.add_argument(
         "--keep-source",
@@ -450,7 +457,7 @@ def download_file(url: str, destination: Path, referer: str) -> None:
         destination.write_bytes(response.read())
 
 
-def convert_to_gif(
+def convert_video_to_gif(
     ffmpeg: str, source: Path, destination: Path, fps: int, width: int
 ) -> None:
     video_filter = (
@@ -463,7 +470,11 @@ def convert_to_gif(
         ffmpeg,
         "-hide_banner",
         "-loglevel",
-        "error",
+        "fatal",
+        "-threads",
+        "1",
+        "-filter_complex_threads",
+        "1",
         "-y",
         "-i",
         str(source),
@@ -476,13 +487,71 @@ def convert_to_gif(
     subprocess.run(command, check=True)
 
 
+def convert_image_to_gif(
+    ffmpeg: str, source: Path, destination: Path, width: int
+) -> None:
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "fatal",
+        "-threads",
+        "1",
+        "-y",
+        "-i",
+        str(source),
+        "-vf",
+        f"scale='min({width},iw)':-2:flags=lanczos",
+        "-frames:v",
+        "1",
+        str(destination),
+    ]
+    subprocess.run(command, check=True)
+
+
+def process_media(
+    index: int,
+    media_type: str,
+    url: str,
+    temp_dir: Path,
+    output_dir: Path,
+    referer: str,
+    ffmpeg: str,
+    fps: int,
+    width: int,
+    keep_source: bool,
+) -> tuple[int, str, str | None]:
+    stem = f"arcacon_{index:03d}"
+    source_suffix = (
+        ".mp4"
+        if media_type == "mp4"
+        else Path(urlparse(url).path).suffix.lower() or ".img"
+    )
+    source_path = temp_dir / f"{stem}{source_suffix}"
+    gif_path = output_dir / f"{stem}.gif"
+
+    try:
+        download_file(url, source_path, referer)
+        if media_type == "mp4":
+            convert_video_to_gif(ffmpeg, source_path, gif_path, fps, width)
+        else:
+            convert_image_to_gif(ffmpeg, source_path, gif_path, width)
+        return index, gif_path.name, None
+    except Exception as exc:
+        gif_path.unlink(missing_ok=True)
+        return index, gif_path.name, str(exc)
+    finally:
+        if not keep_source:
+            source_path.unlink(missing_ok=True)
+
+
 def main() -> int:
     args = parse_args()
     if not ARCA_URL_RE.match(args.url):
         print("오류: https://arca.live/e/숫자 형태의 링크를 입력하세요.", file=sys.stderr)
         return 2
-    if args.fps < 1 or args.width < 16 or args.wait < 0:
-        print("오류: fps, width, wait 값을 확인하세요.", file=sys.stderr)
+    if args.fps < 1 or args.width < 16 or args.wait < 0 or args.workers < 1:
+        print("오류: fps, width, wait, workers 값을 확인하세요.", file=sys.stderr)
         return 2
 
     try:
@@ -510,27 +579,42 @@ def main() -> int:
 
         print(
             f"[3/3] 영상 {len(video_urls)}개, 이미지 {len(image_urls)}개를 "
-            "GIF로 변환합니다."
+            f"GIF로 변환합니다. (병렬 작업 {args.workers}개)"
         )
         completed = 0
-        for index, (media_type, url) in enumerate(media, 1):
-            stem = f"arcacon_{index:03d}"
-            source_suffix = (
-                ".mp4"
-                if media_type == "mp4"
-                else Path(urlparse(url).path).suffix.lower() or ".img"
-            )
-            source_path = temp_dir / f"{stem}{source_suffix}"
-            gif_path = output_dir / f"{stem}.gif"
-            try:
-                download_file(url, source_path, args.url)
-                convert_to_gif(ffmpeg, source_path, gif_path, args.fps, args.width)
-                completed += 1
-                print(f"      [{index}/{len(media)}] {gif_path.name}")
-                if not args.keep_source:
-                    source_path.unlink(missing_ok=True)
-            except Exception as exc:
-                print(f"      [{index}/{len(media)}] 실패: {exc}", file=sys.stderr)
+        finished = 0
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = [
+                executor.submit(
+                    process_media,
+                    index,
+                    media_type,
+                    url,
+                    temp_dir,
+                    output_dir,
+                    args.url,
+                    ffmpeg,
+                    args.fps,
+                    args.width,
+                    args.keep_source,
+                )
+                for index, (media_type, url) in enumerate(media, 1)
+            ]
+            for future in as_completed(futures):
+                index, gif_name, error = future.result()
+                finished += 1
+                if error is None:
+                    completed += 1
+                    print(
+                        f"      [{finished}/{len(media)} 완료] "
+                        f"{gif_name} (원본 #{index})"
+                    )
+                else:
+                    print(
+                        f"      [{finished}/{len(media)} 완료] "
+                        f"{gif_name} 실패: {error}",
+                        file=sys.stderr,
+                    )
 
         if not args.keep_source:
             try:

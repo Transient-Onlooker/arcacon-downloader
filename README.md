@@ -36,6 +36,7 @@ download/<아카콘 이름>(<번호>)/
 
 ```powershell
 python arcacon.py https://arca.live/e/52927 --fps 20 --width 384
+python arcacon.py https://arca.live/e/52927 --workers 4
 python arcacon.py https://arca.live/e/52927 --keep-source
 python arcacon.py https://arca.live/e/52927 --headless
 ```
