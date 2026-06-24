@@ -16,6 +16,11 @@ from urllib.parse import urlparse
 
 ARCA_URL_RE = re.compile(r"^https?://(?:www\.)?arca\.live/e/\d+/?(?:[?#].*)?$")
 MP4_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.mp4(?:\?[^\s\"'<>]*)?", re.I)
+IMAGE_URL_RE = re.compile(
+    r"https?://[^\s\"'<>]+/\d{8}sac/[^\s\"'<>]+\."
+    r"(?:png|jpe?g|webp|gif)(?:\?[^\s\"'<>]*)?",
+    re.I,
+)
 INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home()))
 BROWSER_CANDIDATES = (
@@ -53,7 +58,7 @@ BROWSER_CANDIDATES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="아카콘 링크에서 MP4를 찾아 GIF로 변환합니다."
+        description="아카콘 링크에서 영상과 이미지를 찾아 GIF로 변환합니다."
     )
     parser.add_argument("url", help="예: https://arca.live/e/52927")
     parser.add_argument(
@@ -67,7 +72,11 @@ def parse_args() -> argparse.Namespace:
         "--wait", type=float, default=0.18, help="각 요소 hover 대기 시간"
     )
     parser.add_argument(
-        "--keep-mp4", action="store_true", help="변환 후 원본 MP4 유지"
+        "--keep-source",
+        "--keep-mp4",
+        dest="keep_source",
+        action="store_true",
+        help="변환 후 원본 영상·이미지 유지",
     )
     parser.add_argument(
         "--headless",
@@ -106,6 +115,12 @@ def extract_mp4_urls(value: object) -> list[str]:
     if not isinstance(value, str):
         return []
     return [match.rstrip("),]") for match in MP4_URL_RE.findall(value)]
+
+
+def extract_image_urls(value: object) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    return [match.rstrip("),]") for match in IMAGE_URL_RE.findall(value)]
 
 
 def collect_from_performance_log(driver) -> set[str]:
@@ -153,6 +168,35 @@ def collect_from_page(driver) -> set[str]:
         return [...found];
     """
     return set(driver.execute_script(script))
+
+
+def collect_images_from_element(driver, element) -> set[str]:
+    values = driver.execute_script(
+        """
+        const root = arguments[0];
+        const values = [];
+        const add = value => {
+          if (typeof value === 'string' && value) values.push(value);
+        };
+        const inspect = element => {
+          add(element.currentSrc);
+          add(element.src);
+          add(element.getAttribute?.('src'));
+          add(element.getAttribute?.('data-src'));
+          add(element.getAttribute?.('data-original'));
+          add(element.getAttribute?.('poster'));
+          add(getComputedStyle(element).backgroundImage);
+        };
+        inspect(root);
+        root.querySelectorAll?.('img, source, video').forEach(inspect);
+        return values;
+        """,
+        element,
+    )
+    urls: set[str] = set()
+    for value in values:
+        urls.update(extract_image_urls(value))
+    return urls
 
 
 def get_pack_title(driver) -> str:
@@ -238,14 +282,14 @@ def is_cloudflare_challenge(driver) -> bool:
     )
 
 
-def find_mp4_urls(
+def find_media_urls(
     page_url: str,
     browser_name: str,
     driver_kind: str,
     browser_path: Path,
     wait: float,
     headless: bool,
-) -> tuple[list[str], str]:
+) -> tuple[list[str], list[str], str]:
     from selenium import webdriver
     from selenium.common.exceptions import WebDriverException
     from selenium.webdriver.common.action_chains import ActionChains
@@ -282,7 +326,8 @@ def find_mp4_urls(
             headless=headless,
             use_subprocess=True,
         )
-    urls: set[str] = set()
+    video_urls: set[str] = set()
+    image_urls: set[str] = set()
     pack_title = ""
 
     try:
@@ -324,16 +369,13 @@ def find_mp4_urls(
 
         time.sleep(1.5)
         pack_title = get_pack_title(driver)
-        urls.update(collect_from_page(driver))
-        urls.update(collect_from_performance_log(driver))
+        video_urls.update(collect_from_page(driver))
+        video_urls.update(collect_from_performance_log(driver))
 
-        print("[2/3] 아카콘 영상 요청을 수집하는 중...")
+        print("[2/3] 아카콘 이미지와 영상 요청을 수집하는 중...")
         elements = driver.find_elements(
             By.CSS_SELECTOR,
-            (
-                "img, picture, video, [data-src], [data-original], [data-video], "
-                "[style*='background']"
-            ),
+            "img, video",
         )
 
         hovered = 0
@@ -347,6 +389,11 @@ def find_mp4_urls(
                 if size["width"] > 700 or size["height"] > 700:
                     continue
 
+                candidate_images = collect_images_from_element(driver, element)
+                if not candidate_images and element.tag_name.lower() != "video":
+                    continue
+
+                videos_before = set(video_urls)
                 driver.execute_script(
                     "arguments[0].scrollIntoView({block:'center', inline:'center'});",
                     element,
@@ -355,10 +402,13 @@ def find_mp4_urls(
                 time.sleep(wait)
                 hovered += 1
 
-                urls.update(collect_from_page(driver))
-                urls.update(collect_from_performance_log(driver))
+                video_urls.update(collect_from_page(driver))
+                video_urls.update(collect_from_performance_log(driver))
+                if not (video_urls - videos_before):
+                    image_urls.update(candidate_images)
                 print(
-                    f"      요소 {hovered}개 확인 / MP4 {len(urls)}개 발견",
+                    f"      요소 {hovered}개 확인 / "
+                    f"영상 {len(video_urls)}개 / 이미지 {len(image_urls)}개",
                     end="\r",
                     flush=True,
                 )
@@ -366,8 +416,8 @@ def find_mp4_urls(
                 continue
 
         print()
-        urls.update(collect_from_page(driver))
-        urls.update(collect_from_performance_log(driver))
+        video_urls.update(collect_from_page(driver))
+        video_urls.update(collect_from_performance_log(driver))
     finally:
         try:
             driver.quit()
@@ -379,10 +429,10 @@ def find_mp4_urls(
                 except subprocess.TimeoutExpired:
                     browser_process.kill()
 
-    return sorted(urls), pack_title
+    return sorted(video_urls), sorted(image_urls), pack_title
 
 
-def download_mp4(url: str, destination: Path, referer: str) -> None:
+def download_file(url: str, destination: Path, referer: str) -> None:
     request = urllib.request.Request(
         url,
         headers={
@@ -438,7 +488,7 @@ def main() -> int:
     try:
         ffmpeg, browser_name, driver_kind, browser_path = require_environment()
         print(f"브라우저: {browser_name}")
-        urls, pack_title = find_mp4_urls(
+        video_urls, image_urls, pack_title = find_media_urls(
             args.url,
             browser_name,
             driver_kind,
@@ -446,33 +496,43 @@ def main() -> int:
             args.wait,
             args.headless,
         )
-        if not urls:
+        media = [("mp4", url) for url in video_urls]
+        media.extend(("image", url) for url in image_urls)
+        if not media:
             raise RuntimeError(
-                "MP4 요청을 찾지 못했습니다. 페이지가 완전히 표시됐는지 확인하세요."
+                "아카콘 미디어를 찾지 못했습니다. 페이지가 완전히 표시됐는지 확인하세요."
             )
 
         pack_id = urlparse(args.url).path.rstrip("/").split("/")[-1]
         output_dir = args.output.resolve() / safe_folder_name(pack_title, pack_id)
-        temp_dir = output_dir / "_mp4"
+        temp_dir = output_dir / "_source"
         temp_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"[3/3] {len(urls)}개 파일을 다운로드하고 GIF로 변환합니다.")
+        print(
+            f"[3/3] 영상 {len(video_urls)}개, 이미지 {len(image_urls)}개를 "
+            "GIF로 변환합니다."
+        )
         completed = 0
-        for index, url in enumerate(urls, 1):
+        for index, (media_type, url) in enumerate(media, 1):
             stem = f"arcacon_{index:03d}"
-            mp4_path = temp_dir / f"{stem}.mp4"
+            source_suffix = (
+                ".mp4"
+                if media_type == "mp4"
+                else Path(urlparse(url).path).suffix.lower() or ".img"
+            )
+            source_path = temp_dir / f"{stem}{source_suffix}"
             gif_path = output_dir / f"{stem}.gif"
             try:
-                download_mp4(url, mp4_path, args.url)
-                convert_to_gif(ffmpeg, mp4_path, gif_path, args.fps, args.width)
+                download_file(url, source_path, args.url)
+                convert_to_gif(ffmpeg, source_path, gif_path, args.fps, args.width)
                 completed += 1
-                print(f"      [{index}/{len(urls)}] {gif_path.name}")
-                if not args.keep_mp4:
-                    mp4_path.unlink(missing_ok=True)
+                print(f"      [{index}/{len(media)}] {gif_path.name}")
+                if not args.keep_source:
+                    source_path.unlink(missing_ok=True)
             except Exception as exc:
-                print(f"      [{index}/{len(urls)}] 실패: {exc}", file=sys.stderr)
+                print(f"      [{index}/{len(media)}] 실패: {exc}", file=sys.stderr)
 
-        if not args.keep_mp4:
+        if not args.keep_source:
             try:
                 temp_dir.rmdir()
             except OSError:

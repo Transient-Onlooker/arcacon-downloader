@@ -1,6 +1,7 @@
 # arcacon-downloader
 
-아카콘 페이지 링크를 받아 MP4 요청을 자동 수집하고 GIF로 변환하는 CLI입니다.
+아카콘 페이지 링크를 받아 영상과 정적 이미지를 자동 수집하고 GIF로 변환하는
+CLI입니다.
 
 ## 설치
 
@@ -35,7 +36,7 @@ download/<아카콘 이름>(<번호>)/
 
 ```powershell
 python arcacon.py https://arca.live/e/52927 --fps 20 --width 384
-python arcacon.py https://arca.live/e/52927 --keep-mp4
+python arcacon.py https://arca.live/e/52927 --keep-source
 python arcacon.py https://arca.live/e/52927 --headless
 ```
 
