@@ -29,7 +29,15 @@ if not defined ARCA_URL (
     pause
     exit /b 1
 )
-python arcacon.py "%ARCA_URL%"
+
+set "WORKERS="
+echo Available CPU threads: %NUMBER_OF_PROCESSORS%
+set /p "WORKERS=Parallel workers (1-%NUMBER_OF_PROCESSORS%, blank=auto): "
+if not defined WORKERS (
+    python arcacon.py "%ARCA_URL%"
+) else (
+    python arcacon.py "%ARCA_URL%" --workers "%WORKERS%"
+)
 
 :finish
 set "EXIT_CODE=%ERRORLEVEL%"

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
 import os
 import re
 import shutil
@@ -18,8 +17,8 @@ from urllib.parse import urlparse
 ARCA_URL_RE = re.compile(r"^https?://(?:www\.)?arca\.live/e/\d+/?(?:[?#].*)?$")
 MP4_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.mp4(?:\?[^\s\"'<>]*)?", re.I)
 IMAGE_URL_RE = re.compile(
-    r"https?://[^\s\"'<>]+/\d{8}sac/[^\s\"'<>]+\."
-    r"(?:png|jpe?g|webp|gif)(?:\?[^\s\"'<>]*)?",
+    r"https?://(?:[^/\s\"'<>]+\.)?(?:namu\.la|arca\.live)/"
+    r"[^\s\"'<>]+\.(?:png|jpe?g|webp|gif)(?:\?[^\s\"'<>]*)?",
     re.I,
 )
 INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -70,7 +69,7 @@ def parse_args() -> argparse.Namespace:
         "--width", type=int, default=512, help="GIF 최대 너비 (기본: 512)"
     )
     parser.add_argument(
-        "--wait", type=float, default=0.18, help="각 요소 hover 대기 시간"
+        "--wait", type=float, default=0.08, help="각 요소 hover 대기 시간"
     )
     parser.add_argument(
         "--workers",
@@ -130,35 +129,11 @@ def extract_image_urls(value: object) -> list[str]:
     return [match.rstrip("),]") for match in IMAGE_URL_RE.findall(value)]
 
 
-def collect_from_performance_log(driver) -> set[str]:
-    from selenium.common.exceptions import WebDriverException
-
-    urls: set[str] = set()
-    try:
-        entries = driver.get_log("performance")
-    except WebDriverException:
-        return urls
-
-    for item in entries:
-        try:
-            message = json.loads(item["message"])["message"]
-        except (KeyError, TypeError, json.JSONDecodeError):
-            continue
-
-        if message.get("method") != "Network.responseReceived":
-            continue
-
-        response = message.get("params", {}).get("response", {})
-        url = response.get("url", "")
-        mime = str(response.get("mimeType", "")).lower()
-        if ".mp4" in url.lower() or mime == "video/mp4":
-            urls.update(extract_mp4_urls(url))
-    return urls
-
-
-def collect_from_page(driver) -> set[str]:
-    script = r"""
-        const found = new Set();
+def install_mp4_observer(driver) -> set[str]:
+    urls = driver.execute_script(
+        r"""
+        window.__arcaconMp4Urls = new Set();
+        const found = window.__arcaconMp4Urls;
         const add = value => {
           if (typeof value !== "string") return;
           const matches = value.match(/https?:\/\/[^\s"'<>]+\.mp4(?:\?[^\s"'<>]*)?/ig);
@@ -166,44 +141,198 @@ def collect_from_page(driver) -> set[str]:
         };
 
         performance.getEntriesByType("resource").forEach(entry => add(entry.name));
-        document.querySelectorAll("*").forEach(el => {
-          add(el.currentSrc);
-          add(el.src);
-          add(el.href);
-          for (const attr of el.attributes || []) add(attr.value);
-        });
-        return [...found];
-    """
-    return set(driver.execute_script(script))
-
-
-def collect_images_from_element(driver, element) -> set[str]:
-    values = driver.execute_script(
-        """
-        const root = arguments[0];
-        const values = [];
-        const add = value => {
-          if (typeof value === 'string' && value) values.push(value);
-        };
-        const inspect = element => {
+        document.querySelectorAll("video, source").forEach(element => {
           add(element.currentSrc);
           add(element.src);
-          add(element.getAttribute?.('src'));
-          add(element.getAttribute?.('data-src'));
-          add(element.getAttribute?.('data-original'));
-          add(element.getAttribute?.('poster'));
-          add(getComputedStyle(element).backgroundImage);
+        });
+        window.__arcaconMp4Observer?.disconnect();
+        window.__arcaconMp4Observer = new PerformanceObserver(list => {
+          list.getEntries().forEach(entry => add(entry.name));
+        });
+        window.__arcaconMp4Observer.observe({type: "resource", buffered: true});
+        return [...found];
+        """
+    )
+    return set(urls)
+
+
+def read_observed_mp4_urls(driver) -> set[str]:
+    urls = driver.execute_script(
+        r"""
+        const found = window.__arcaconMp4Urls || new Set();
+        const add = value => {
+          if (typeof value !== "string") return;
+          const matches = value.match(/https?:\/\/[^\s"'<>]+\.mp4(?:\?[^\s"'<>]*)?/ig);
+          if (matches) matches.forEach(url => found.add(url));
         };
-        inspect(root);
-        root.querySelectorAll?.('img, source, video').forEach(inspect);
-        return values;
+        document.querySelectorAll("video, source").forEach(element => {
+          add(element.currentSrc);
+          add(element.src);
+        });
+        return [...found];
+        """
+    )
+    return set(urls)
+
+
+def collect_image_urls_for_elements(driver, elements: list) -> list[set[str]]:
+    values_by_element = driver.execute_script(
+        """
+        return arguments[0].map(root => {
+          const values = [];
+          const add = value => {
+            if (typeof value === 'string' && value) values.push(value);
+          };
+          const inspect = element => {
+            add(element.currentSrc);
+            add(element.src);
+            add(element.getAttribute?.('src'));
+            add(element.getAttribute?.('data-src'));
+            add(element.getAttribute?.('data-original'));
+            add(element.getAttribute?.('poster'));
+            add(getComputedStyle(element).backgroundImage);
+          };
+          inspect(root);
+          root.querySelectorAll?.('img, source, video').forEach(inspect);
+          return values;
+        });
+        """,
+        elements,
+    )
+    result: list[set[str]] = []
+    for values in values_by_element:
+        urls: set[str] = set()
+        for value in values:
+            urls.update(extract_image_urls(value))
+        result.append(urls)
+    return result
+
+
+def trigger_hover(driver, element) -> None:
+    point = driver.execute_script(
+        """
+        const element = arguments[0];
+        element.scrollIntoView({block: 'center', inline: 'center'});
+        const rect = element.getBoundingClientRect();
+        return {
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2
+        };
         """,
         element,
     )
-    urls: set[str] = set()
-    for value in values:
-        urls.update(extract_image_urls(value))
-    return urls
+    driver.execute_cdp_cmd(
+        "Input.dispatchMouseEvent",
+        {
+            "type": "mouseMoved",
+            "x": point["x"],
+            "y": point["y"],
+            "button": "none",
+            "buttons": 0,
+            "pointerType": "mouse",
+        },
+    )
+
+
+def load_pack_media_elements(driver) -> list:
+    exact_elements = driver.execute_script(
+        """
+        return [...document.querySelectorAll(
+          '.article-body.emoticon-body .emoticons-wrapper > img.emoticon'
+        )];
+        """
+    )
+    if exact_elements:
+        for index in range(0, len(exact_elements), 12):
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});",
+                exact_elements[index],
+            )
+            time.sleep(0.12)
+        driver.execute_script("window.scrollTo(0, 0)")
+        time.sleep(0.2)
+        return driver.execute_script(
+            """
+            return [...document.querySelectorAll(
+              '.article-body.emoticon-body .emoticons-wrapper > img.emoticon'
+            )];
+            """
+        )
+
+    # Fallback for a future page structure change.
+    boundary = driver.execute_script(
+        """
+        const documentY = element =>
+          element.getBoundingClientRect().top + window.scrollY;
+        const visible = element => {
+          const style = getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            rect.width > 0 && rect.height > 0;
+        };
+
+        const rankingBoundaries = [];
+        document.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(element => {
+          const text = (element.textContent || '').replace(/\\s+/g, ' ').trim();
+          if (text.includes('전체 아카콘') && visible(element)) {
+            rankingBoundaries.push(documentY(element));
+          }
+        });
+        if (rankingBoundaries.length) return Math.min(...rankingBoundaries);
+
+        const purchaseBoundaries = [];
+        document.querySelectorAll('button, a, [role="button"]').forEach(element => {
+          const text = (element.textContent || '').replace(/\\s+/g, ' ').trim();
+          if (text.includes('구매하기') && visible(element)) {
+            purchaseBoundaries.push(documentY(element));
+          }
+        });
+        return purchaseBoundaries.length ? Math.max(...purchaseBoundaries) : null;
+        """
+    )
+    if boundary is None:
+        boundary = driver.execute_script(
+            "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)"
+        )
+
+    viewport = driver.execute_script("return window.innerHeight") or 800
+    step = max(300, int(viewport * 0.75))
+    position = 0
+    while position < boundary:
+        driver.execute_script("window.scrollTo(0, arguments[0])", position)
+        time.sleep(0.12)
+        new_boundary = driver.execute_script(
+            """
+            const documentY = element =>
+              element.getBoundingClientRect().top + window.scrollY;
+            const headings = [...document.querySelectorAll('h1, h2, h3, h4, h5, h6')]
+              .filter(element =>
+                (element.textContent || '').replace(/\\s+/g, ' ').trim()
+                  .includes('전체 아카콘')
+              );
+            return headings.length
+              ? Math.min(...headings.map(documentY))
+              : arguments[0];
+            """,
+            boundary,
+        )
+        boundary = min(boundary, new_boundary)
+        position += step
+
+    driver.execute_script("window.scrollTo(0, 0)")
+    time.sleep(0.2)
+    return driver.execute_script(
+        """
+        const boundary = arguments[0];
+        const documentY = element =>
+          element.getBoundingClientRect().top + window.scrollY;
+        return [...document.querySelectorAll(
+          'img, video, picture, [data-src], [data-original], [data-video]'
+        )].filter(element => documentY(element) < boundary);
+        """,
+        boundary,
+    )
 
 
 def get_pack_title(driver) -> str:
@@ -296,11 +425,9 @@ def find_media_urls(
     browser_path: Path,
     wait: float,
     headless: bool,
-) -> tuple[list[str], list[str], str]:
+) -> tuple[list[str], list[str], str, dict[str, str]]:
     from selenium import webdriver
     from selenium.common.exceptions import WebDriverException
-    from selenium.webdriver.common.action_chains import ActionChains
-    from selenium.webdriver.common.by import By
 
     profile_dir = LOCAL_APP_DATA / (
         f"arcacon-downloader/{browser_name.lower()}-profile"
@@ -336,6 +463,7 @@ def find_media_urls(
     video_urls: set[str] = set()
     image_urls: set[str] = set()
     pack_title = ""
+    request_headers: dict[str, str] = {}
 
     try:
         print("[1/3] 아카콘 페이지를 여는 중...")
@@ -376,17 +504,23 @@ def find_media_urls(
 
         time.sleep(1.5)
         pack_title = get_pack_title(driver)
-        video_urls.update(collect_from_page(driver))
-        video_urls.update(collect_from_performance_log(driver))
+        request_headers["User-Agent"] = driver.execute_script(
+            "return navigator.userAgent"
+        )
+        cookies = driver.get_cookies()
+        if cookies:
+            request_headers["Cookie"] = "; ".join(
+                f"{cookie['name']}={cookie['value']}" for cookie in cookies
+            )
+        seen_video_urls = install_mp4_observer(driver)
 
         print("[2/3] 아카콘 이미지와 영상 요청을 수집하는 중...")
-        elements = driver.find_elements(
-            By.CSS_SELECTOR,
-            "img, video",
-        )
+        elements = load_pack_media_elements(driver)
+        print(f"      본문 미디어 후보 {len(elements)}개")
+        candidate_images_by_index = collect_image_urls_for_elements(driver, elements)
 
         hovered = 0
-        for element in elements:
+        for element, candidate_images in zip(elements, candidate_images_by_index):
             try:
                 if not element.is_displayed():
                     continue
@@ -396,35 +530,38 @@ def find_media_urls(
                 if size["width"] > 700 or size["height"] > 700:
                     continue
 
-                candidate_images = collect_images_from_element(driver, element)
                 if not candidate_images and element.tag_name.lower() != "video":
                     continue
 
-                videos_before = set(video_urls)
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block:'center', inline:'center'});",
-                    element,
-                )
-                ActionChains(driver).move_to_element(element).perform()
-                time.sleep(wait)
+                trigger_hover(driver, element)
                 hovered += 1
 
-                video_urls.update(collect_from_page(driver))
-                video_urls.update(collect_from_performance_log(driver))
-                if not (video_urls - videos_before):
+                new_videos: set[str] = set()
+                hover_deadline = time.perf_counter() + wait
+                while time.perf_counter() < hover_deadline:
+                    time.sleep(min(0.03, max(0.005, wait)))
+                    discovered = read_observed_mp4_urls(driver)
+                    new_videos = discovered - seen_video_urls
+                    if new_videos:
+                        break
+                final_discovered = read_observed_mp4_urls(driver)
+                new_videos.update(final_discovered - seen_video_urls)
+                seen_video_urls.update(final_discovered)
+                if new_videos:
+                    video_urls.update(new_videos)
+                else:
                     image_urls.update(candidate_images)
-                print(
-                    f"      요소 {hovered}개 확인 / "
-                    f"영상 {len(video_urls)}개 / 이미지 {len(image_urls)}개",
-                    end="\r",
-                    flush=True,
-                )
+                if new_videos or hovered % 10 == 0 or hovered == len(elements):
+                    print(
+                        f"      요소 {hovered}/{len(elements)}개 확인 / "
+                        f"영상 {len(video_urls)}개 / 이미지 {len(image_urls)}개",
+                        end="\r",
+                        flush=True,
+                    )
             except WebDriverException:
                 continue
 
         print()
-        video_urls.update(collect_from_page(driver))
-        video_urls.update(collect_from_performance_log(driver))
     finally:
         try:
             driver.quit()
@@ -436,20 +573,31 @@ def find_media_urls(
                 except subprocess.TimeoutExpired:
                     browser_process.kill()
 
-    return sorted(video_urls), sorted(image_urls), pack_title
+    return sorted(video_urls), sorted(image_urls), pack_title, request_headers
 
 
-def download_file(url: str, destination: Path, referer: str) -> None:
+def download_file(
+    url: str,
+    destination: Path,
+    referer: str,
+    session_headers: dict[str, str] | None = None,
+) -> None:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/138.0.0.0 Safari/537.36"
+        ),
+        "Referer": referer,
+        "Origin": "https://arca.live",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,"
+        "image/*,video/*,*/*;q=0.8",
+    }
+    if session_headers:
+        headers.update(session_headers)
     request = urllib.request.Request(
         url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/138.0.0.0 Safari/537.36"
-            ),
-            "Referer": referer,
-        },
+        headers=headers,
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         if response.status not in (200, 206):
@@ -516,6 +664,7 @@ def process_media(
     temp_dir: Path,
     output_dir: Path,
     referer: str,
+    session_headers: dict[str, str],
     ffmpeg: str,
     fps: int,
     width: int,
@@ -531,7 +680,7 @@ def process_media(
     gif_path = output_dir / f"{stem}.gif"
 
     try:
-        download_file(url, source_path, referer)
+        download_file(url, source_path, referer, session_headers)
         if media_type == "mp4":
             convert_video_to_gif(ffmpeg, source_path, gif_path, fps, width)
         else:
@@ -557,7 +706,7 @@ def main() -> int:
     try:
         ffmpeg, browser_name, driver_kind, browser_path = require_environment()
         print(f"브라우저: {browser_name}")
-        video_urls, image_urls, pack_title = find_media_urls(
+        video_urls, image_urls, pack_title, session_headers = find_media_urls(
             args.url,
             browser_name,
             driver_kind,
@@ -593,6 +742,7 @@ def main() -> int:
                     temp_dir,
                     output_dir,
                     args.url,
+                    session_headers,
                     ffmpeg,
                     args.fps,
                     args.width,
