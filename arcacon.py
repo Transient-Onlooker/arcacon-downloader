@@ -25,26 +25,6 @@ INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home()))
 BROWSER_CANDIDATES = (
     (
-        "Brave",
-        "chrome",
-        (
-            LOCAL_APP_DATA / r"BraveSoftware\Brave-Browser\Application\brave.exe",
-            Path(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
-            Path(
-                r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe"
-            ),
-        ),
-    ),
-    (
-        "Chrome",
-        "chrome",
-        (
-            LOCAL_APP_DATA / r"Google\Chrome\Application\chrome.exe",
-            Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-            Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-        ),
-    ),
-    (
         "Edge",
         "edge",
         (
@@ -60,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="아카콘 링크에서 영상과 이미지를 찾아 GIF로 변환합니다."
     )
-    parser.add_argument("url", help="예: https://arca.live/e/52927")
+    parser.add_argument("url", nargs="?", help="예: https://arca.live/e/52927")
     parser.add_argument(
         "-o", "--output", type=Path, default=Path("download"), help="출력 폴더"
     )
@@ -92,8 +72,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def find_ffmpeg() -> str | None:
+    """Return the bundled FFmpeg first, then fall back to PATH for source runs."""
+    if getattr(sys, "frozen", False):
+        bundle_dir = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        for bundled_ffmpeg in (
+            bundle_dir / "ffmpeg.exe",
+            bundle_dir / "ffmpeg" / "ffmpeg.exe",
+        ):
+            if bundled_ffmpeg.is_file():
+                return str(bundled_ffmpeg)
+    return shutil.which("ffmpeg")
+
+
 def require_environment() -> tuple[str, str, str, Path]:
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = find_ffmpeg()
     if not ffmpeg:
         raise RuntimeError("ffmpeg를 찾지 못했습니다. ffmpeg를 PATH에 추가하세요.")
 
@@ -104,7 +97,7 @@ def require_environment() -> tuple[str, str, str, Path]:
             browser = (name, driver_kind, executable)
             break
     if browser is None:
-        raise RuntimeError("Brave, Chrome, Edge 중 설치된 브라우저를 찾지 못했습니다.")
+        raise RuntimeError("Microsoft Edge를 찾지 못했습니다. Edge를 설치한 뒤 다시 실행하세요.")
 
     try:
         import selenium  # noqa: F401
@@ -429,9 +422,7 @@ def find_media_urls(
     from selenium import webdriver
     from selenium.common.exceptions import WebDriverException
 
-    profile_dir = LOCAL_APP_DATA / (
-        f"arcacon-downloader/{browser_name.lower()}-profile"
-    )
+    profile_dir = LOCAL_APP_DATA / "arcacon-downloader" / "edge-profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
     browser_process = None
     if driver_kind == "edge":
@@ -694,8 +685,38 @@ def process_media(
             source_path.unlink(missing_ok=True)
 
 
-def main() -> int:
-    args = parse_args()
+def prompt_for_args(args: argparse.Namespace) -> argparse.Namespace:
+    print("아카콘 다운로더")
+    print("종료하려면 Ctrl+C를 누르세요.\n")
+
+    while not args.url:
+        url = input("아카콘 URL: ").strip()
+        if ARCA_URL_RE.match(url):
+            args.url = url
+        else:
+            print("https://arca.live/e/숫자 형식의 링크를 입력하세요.\n")
+
+    cpu_count = max(1, os.cpu_count() or 1)
+    while True:
+        value = input(
+            f"병렬 작업 수 (1-{cpu_count}, Enter=자동 {args.workers}): "
+        ).strip()
+        if not value:
+            break
+        try:
+            workers = int(value)
+        except ValueError:
+            workers = 0
+        if 1 <= workers <= cpu_count:
+            args.workers = workers
+            break
+        print(f"1부터 {cpu_count} 사이의 숫자를 입력하세요.")
+
+    print()
+    return args
+
+
+def run(args: argparse.Namespace) -> int:
     if not ARCA_URL_RE.match(args.url):
         print("오류: https://arca.live/e/숫자 형태의 링크를 입력하세요.", file=sys.stderr)
         return 2
@@ -784,6 +805,24 @@ def main() -> int:
     except Exception as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return 1
+
+
+def main() -> int:
+    args = parse_args()
+    interactive = args.url is None
+    try:
+        if interactive:
+            args = prompt_for_args(args)
+        return run(args)
+    except (EOFError, KeyboardInterrupt):
+        print("\n중단하였습니다.", file=sys.stderr)
+        return 130
+    finally:
+        if interactive:
+            try:
+                input("\nEnter를 누르면 창을 닫습니다...")
+            except (EOFError, KeyboardInterrupt):
+                pass
 
 
 if __name__ == "__main__":

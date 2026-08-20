@@ -11,3 +11,6 @@ browser-profile/
 brave-profile/
 chrome-profile/
 edge-profile/
+build/
+dist/
+*.spec
